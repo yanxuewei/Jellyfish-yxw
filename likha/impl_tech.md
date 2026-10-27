@@ -258,13 +258,35 @@ Jellyfish/
 │   ├── guide/                        # 开发指南 how-to
 │   └── blog/                         # release note（固化后不得修改）
 ├── docs/                             # README 多语言 + 截图
-├── .github/workflows/                # CI/CD（见 3.4）
+├── .github/workflows/                # CI/CD（见 3.7）
 ├── AGENTS.md                         # 工程约定（分层职责/状态语义/文档规则）
 ├── pytest.ini / conftest.py / pyrightconfig.json
 └── likha/impl_tech.md                # 本文档
 ```
 
-### 3.2 后端逻辑分层规则（强约束）
+> 规模基线（2026-10-27 统计）：backend 共 **243 个 `.py` 文件**（其中 `tests/` 46 个测试文件）；front 共 **360 个源文件**（`.ts/.tsx/.css`），其中 `services/generated/` OpenAPI generated client **264 个文件**（机器生成、禁止手改）。
+
+### 3.2 后端逻辑分层（Python 模块内）
+
+**模块规模与职责（按 `.py` 文件数）：**
+
+| 模块 | 文件数 | 职责 |
+| --- | --- | --- |
+| `app/services/studio/` | 49 | 分镜域业务层：shots/entities/image_task_runner + `generation/`（frame·video·asset_image 各含 build_context/build_submission/derive_preview 四步模型） |
+| `app/api/v1/` | 21 | API 层：routes（health/llm/script_processing/studio×12/film×3）+ 依赖注入 |
+| `app/core/integrations/` | 16 | 供应商适配器：openai/ + volcengine/（images/video/capabilities/payload）+ http_logging |
+| `app/chains/agents/` | 15 | LangGraph Agent：script_divider/element_extractor/consistency_checker/entity_merger/character_portrait 等 |
+| `app/schemas/studio/` + `schemas/skills/` | 9 + 9 | 分镜域与剧本处理技能 Pydantic DTO |
+| `app/services/llm/` | 7 | provider_registry/resolver/runtime/manage（默认模型解析，缺失 503） |
+| `app/core/tasks/` + `core/task_manager/` | 5 + 5 | 任务适配器注册（bootstrap/image·video_generation_tasks）与任务状态机（manager/stores/strategies） |
+| `app/services/worker/` + `services/common/` | 4 + 4 | 执行器模板（task_executor/task_registry/task_logging）与通用服务 |
+| `app/core/contracts/` | 4 | 跨层契约 DTO（provider/image_generation/video_generation） |
+| `app/services/film/` | 3 | 视频与任务查询服务 |
+| `app/models/` | — | SQLAlchemy 2.0 ORM（见第 5 章 ER） |
+| `app/tasks/execute_task.py` | 1 | Celery 统一入口 `run_task_celery` |
+| `app/utils/` | 3 | project_links/files 工具 |
+
+**分层依赖规则（强约束）：**
 
 ```mermaid
 flowchart LR
@@ -279,20 +301,88 @@ flowchart LR
 ```
 
 - `api` 不写业务逻辑，`services` 不感知 HTTP；
-- 生成能力通用契约（输入/输出 DTO、供应商配置）统一放 `core/contracts`；`tasks` 只做任务封装/分派/执行编排；`integrations` 只依赖 `contracts`；
-- API 变更后必须 `pnpm run openapi:update` 同步前端 generated client，禁止新增手写 service 封装。
+- 生成能力通用契约（输入/输出 DTO、供应商配置）统一放 `core/contracts`；`tasks` 只做任务封装/分派/执行编排，不定义跨层 DTO；`integrations` 只依赖 `contracts`，不依赖 `tasks` 类型模块；
+- API 变更后必须 `pnpm run openapi:update` 同步前端 generated client，禁止新增手写 service 封装；
+- 函数/类必须有注释（功能介绍 + 复杂函数的参数/返回值说明），注释与实现同步（AGENTS.md 强制）。
 
-### 3.3 测试体系
+### 3.3 前端目录结构（front/，360 个源文件）
 
-| 层级 | 位置 | 现状 | 目标补充 |
+| 路径 | 文件数 | 内容 |
+| --- | --- | --- |
+| `src/App.tsx` / `main.tsx` / `i18n.ts` | 3 | 路由定义、入口、i18next 初始化（en-US / zh-CN） |
+| `src/layouts/` | 1 | `MainLayout.tsx` 全局布局 |
+| `src/pages/` | 76 | `aiStudio/`（74，主业务域，见 3.4）+ `Settings/` + `NotFound/` |
+| `src/components/` | 3 | `CustomButton` / `CustomCard` 通用组件（重复样式 > 1 次必须抽离，AGENTS.md 强制） |
+| `src/services/` | 5 + 264 | `generated/`（OpenAPI generated client：core/models/services，**唯一后端调用通道**）；`http.ts`（axios 封装，baseURL 取 `VITE_BACKEND_URL`/`VITE_API_BASE_URL`，默认 `http://localhost:8000/api`）；`openapi.ts`（`OpenAPI.BASE` 初始化，支持运行时 `window.__ENV.BACKEND_URL`）；`aiStudioApi.ts`、`filmTaskLinks.ts` |
+| `src/store/` | 1 | `useAppStore.ts`（Zustand 全局状态） |
+| `src/locales/` | — | `en-US/`、`zh-CN/` 扁平 JSON 词条 |
+| `src/mocks/` | 3 | MSW（`browser.ts`/`handlers.ts`/`data.ts`），**仅开发态 mock，未接入测试** |
+| `src/vite-env.d.ts` | 1 | Vite 类型声明 |
+
+**前端架构要点**：构建产物为纯静态 SPA（nginx 容器托管），后端地址经 `env.js` 运行时注入实现镜像与环境解耦；业务页面按「编辑页=准备 / 工作室=生成 / 任务中心=通用面板」三职责划分（见 3.4 与 AGENTS.md 页面职责约定）。
+
+### 3.4 前端业务模块清单（pages/aiStudio/，按文件数）
+
+| 模块 | 文件数 | 页面/职责 | 页面定位（AGENTS.md） |
 | --- | --- | --- | --- |
-| 单元测试 | `backend/tests/`（~40 文件） | API 响应包格式、task_manager/task_registry、LLM resolver、shot 状态/候选/链接、file_usages、integrations 适配器与能力表 | service 层覆盖率提升至 ≥70%；契约测试（contracts schema 兼容性） |
-| 集成测试 | `backend/tests/`（marker: `integration`） | `tests/support/llm_api_app.py` 模拟 LLM API | 引入 testcontainers（MySQL/Redis）跑真实依赖 |
-| 前端测试 | `front/`（MSW mock 已就绪） | 以 mock 支撑开发 | 补充 Vitest 组件测试 + Playwright E2E（覆盖「编辑页→ready→工作室→生成」主链路） |
-| **压测（现无，规划）** | `loadtest/`（新建） | — | k6 场景：① API 基线（400 RPS 混合读写）② 任务风暴（并发 500 视频任务入队）③ 轮询压力（2000 客户端 task_status 轮询）；接入 CI 夜间跑，基线：P99 < 500ms（读）/ < 1.5s（写），错误率 < 0.1% |
-| 契约测试 | CI | — | 后端 OpenAPI diff 检查，Breaking change 阻断合并 |
+| `project/` | 24 | `ProjectLobby`（项目大厅）、`ProjectWorkbench/`（章节划分、拍摄前检查、`RoleDetailPage`） | 项目级入口 |
+| `assets/` | 16 | `AssetManager`（演员/场景/道具/服装 Tab）+ 各资产编辑页 | 一致性资产管理 |
+| `components/` | 9 | `TaskCenter.tsx` + `TaskRuntimeProvider`（taskUiStore/taskResultHelpers）、视频就绪面板、就绪诊断面板、批量工具栏 | **任务中心=通用任务状态面板**：只展示状态/进度/成功失败/取消/回跳，不承载业务重信息 |
+| `chapter/` | 9 | `ChapterStudio`（分镜工作室：视频准备度、关键帧、图片、视频参数与生成）、`ChapterPrep` | **工作室=生成** |
+| `shots/` | 6 | `ChapterShotsPage`（镜头列表）、`ChapterShotEditPage`（分镜编辑页：资产/对白确认、基础信息修正、准备指引） | **编辑页=准备**：推进 `shot.status→ready` |
+| `models/` | 5 | `ModelManagement`（供应商/模型/默认模型管理） | 配置面 |
+| `agents/` | 2 | Agent 管理入口 | 配置面 |
+| `prompts/` / `files/` / `editor/` / `hooks/` | 1×4 | `PromptTemplateManager`、`FileManager`、`VideoEditor`（剪辑）、共享 hooks | 工具面 |
 
-### 3.4 CI/CD 流水线（现状）
+### 3.5 测试设计
+
+| 层级 | 位置 | 规模 | 技术 | 运行方式 |
+| --- | --- | --- | --- | --- |
+| 后端单元/集成测试 | `backend/tests/` | **46 个测试文件** | pytest + FastAPI TestClient；`tests/support/llm_api_app.py` 模拟 LLM API；`integration` marker 区分集成用例 | `uv run pytest`（配置见 `pyproject.toml [tool.pytest.ini_options]` + 根 `pytest.ini`/`conftest.py`） |
+| API 响应契约测试 | `tests/test_*_api_responses.py` 系列 | 覆盖 studio/film/llm 全路由组 | 断言统一响应包 `ApiResponse{code,message,data,meta}` 与错误格式 | 同上 |
+| 任务系统测试 | `tests/`（task_manager/task_registry/task_execute） | 状态机、注册表幂等、取消双通道 | 内存 store 替身 | 同上 |
+| 集成适配器测试 | `tests/core/integrations/` | image 适配器、video 能力表、http_logging | mock httpx transport | 同上 |
+| Agent/剧本处理测试 | `tests/`（script processing agents/tasks） | LangGraph 编排与落库 | mock LLM | 同上 |
+| 前端测试 | — | **0（需补建）** | 目标：Vitest + React Testing Library；Playwright E2E 覆盖「编辑页→ready→工作室→生成→任务中心」主链路 | `pnpm test`（待建） |
+| E2E | — | **0（需补建）** | 目标：staging 环境 Playwright + mock 供应商（7.6.3 冒烟用例自动化） | CI staging 阶段 |
+| 契约测试 | CI | **需补建** | OpenAPI diff（oasdiff），breaking change 阻断合并 | PR 门禁 |
+
+**测试原则**：不写"只为提升覆盖率"的测试；禁止"随机输入 + 固定 sleep + 只打日志"的假压测/假 fuzz（见 3.9）；表驱动 + 显式 fixture + 精确期望输出；DB 行为变更需在真实 MySQL（生产方言）上验证，目标态引入 testcontainers 替代 skip 兜底（现状 `conftest.py` 在 app 导入失败时 skip，CI 覆盖率不明，见 10.5 E3）。
+
+### 3.6 文档设计
+
+| 路径 | 内容 |
+| --- | --- |
+| `AGENTS.md` | 工程规约总纲：api/service 分层职责、注释强制、OpenAPI 同步强制、页面三职责、状态语义三权分立（`shot.status`/runtime status/`video-readiness`）、文档栏目职责、release note 格式规范、标准完成状态定义 |
+| `site/content/docs/architecture/` | **当前真实生效**架构：project-structure、shot-status-flow、shot-page-boundary、task-execution、generation-workspace、llm-default-model-resolution、shot-frame-prompt-generation |
+| `site/content/docs/plans/` | **推进中**计划：development-plan、task-async-cancellation-plan、generation-workspace-refactor |
+| `site/content/docs/guide/` | 开发指南 how-to（"怎么做"） |
+| `site/content/blog/` | release note（固定章节结构 + frontmatter；**固化后不得修改**） |
+| `docs/` | `README.zh/en/ja.md` 多语言介绍 + `img/` 截图（品牌资产） |
+| `.cursor/rules|prompts|skills/` | IDE agent 规约（与 AGENTS.md 对齐） |
+| `likha/impl_tech.md` | 本文档：面向 PH/TH 生产化的技术设计（分层/目录/可观测/存储/部署/SLA/容量/改进） |
+
+**文档强约束**（AGENTS.md）：`architecture` 只记当前事实、`plans` 只记推进中方案，二者不得混写；架构落地但文档未更新 = 未完成；计划变更但文档未更新 = 未完成；release note 采用维护者发布口径与固定章节顺序。
+
+### 3.7 工具链
+
+| 类别 | 工具 | 命令 |
+| --- | --- | --- |
+| 后端包管理/运行 | **uv**（`pyproject.toml`，hatch 构建） | `uv sync` / `uv run <cmd>` |
+| 后端 Lint | pylint（`pyproject [tool.pylint.*]` 配置） | `uv run pylint app` |
+| 后端类型检查 | basedpyright（`pyproject [tool.basedpyright]` + 根 `pyrightconfig.json`） | `uv run basedpyright` |
+| 后端测试 | pytest（`pytest.ini` + `pyproject [tool.pytest.ini_options]` + 根 `conftest.py`） | `uv run pytest` |
+| 前端包管理 | pnpm 9 + Node 20 | `pnpm install` |
+| 前端构建/类型检查 | Vite 5 + TypeScript 5.2（`build = tsc && vite build`） | `pnpm dev`（端口 7788）/ `pnpm build` / `pnpm exec tsc --noEmit` |
+| 前端 Lint | ESLint（`.ts,.tsx`） | `pnpm lint` / `pnpm lint:fix` |
+| **契约同步** | openapi-typescript-codegen（fetch client + useOptions + useUnionTypes） | `pnpm run openapi:update`（= `openapi:fetch` curl 拉 `http://127.0.0.1:8000/openapi.json` + `openapi:gen` 生成到 `src/services/generated`） |
+| 国际化 | i18next（en-US/zh-CN 扁平 JSON） | 词条随功能 PR 同步 |
+| 开发编排 | Docker Compose（`deploy/compose/docker-compose.yml`，8 服务） | `docker compose up -d`；端口：front 7788 / backend 8000 / mysql 3306 / redis 6379 / rustfs 9000-9001 |
+| 镜像构建 | Docker（python:3.12-slim+uv；node20+pnpm9→nginx:1.27-alpine） | `deploy/docker/*.Dockerfile` |
+| 提交规范 | commit-messages workflow 校验首行 `[类型] 摘要` | git commit |
+| CI/CD | GitHub Actions 6 条 workflow（下表） | `.github/workflows/` |
+
+**CI/CD 流水线（现状）：**
 
 | Workflow | 触发 | 内容 |
 | --- | --- | --- |
@@ -301,15 +391,35 @@ flowchart LR
 | `ghcr-images.yml` | main / v* | QEMU+Buildx 构建并推送 backend/front 镜像至 ghcr.io |
 | `tag-release.yml` | v* tag | 自动创建 GitHub Release（tag 注释作摘要） |
 | `deploy-site.yml` | main（site/**） | Hugo 构建部署文档站 |
+| `issues-stale.yml` | 定时 | 15 天无活动标 stale，3 天后关闭 |
 
-**目标态补充**：单测+覆盖率门禁 → OpenAPI diff → 镜像构建（语义化 tag）→ 部署 staging → 冒烟/E2E → 灰度发布（见 4.3）→ 生产全量。
+**目标态补充**（配合 7.5 发布流水线）：单测 + 覆盖率门禁 → OpenAPI diff → 镜像构建（tag = git sha）+ cosign 签名 → 同步 ACR → 迁移预演 → staging 冒烟/E2E → 灰度门禁 → 生产全量。
 
-### 3.5 文档体系（site/content/docs）
+### 3.8 辅助与遗留目录
 
-- `architecture/`：**当前真实生效**的架构（project-structure、shot-status-flow、shot-page-boundary、task-execution、generation-workspace、llm-default-model-resolution、shot-frame-prompt-generation）；
-- `plans/`：**推进中**的计划（development-plan、task-async-cancellation-plan、generation-workspace-refactor）；
-- `guide/`：开发流程 how-to；`blog/`：release note（固化后不得修改）；
-- 强约束：架构落地但文档未更新 = 未完成；计划变更但文档未更新 = 未完成。
+- `backend/sql/`：手写增量迁移 `001~008-*.sql`（prompt 模板、shot 候选、status 去 generating、取消字段、provider base_urls、model_settings、video ratio、action_beats）。**无版本记录表、无 down 迁移**，风险与 Alembic 收编方案见 5.6；
+- `backend/scripts/`：仅 `backfill_file_usages.py`（一次性回填 `file_usages` 多态引用）；
+- 根目录 `conftest.py` / `pytest.ini` / `pyrightconfig.json`：与 `backend/pyproject.toml` 内配置**双轨并存**（pytest 配置两处均可生效），目标态收敛到 pyproject 单源；
+- `front/src/mocks/`：MSW handler 仅服务开发态，**未接入任何测试运行器**（3.5 前端测试补建时复用）；
+- `deploy/.DS_Store` 等系统残留文件：入库噪声，建议 `.gitignore` 清理；
+- `docs/img/`：README 截图与 logo（品牌资产，勿动）；
+- `likha/`：本设计文档目录（生产化方案沉淀地，与 `site/content/docs/plans/` 的推进态文档互为引用）。
+
+### 3.9 压测设计 **[需补建为主]**
+
+**现状**：仓库**没有任何面向 HTTP API / 任务系统的黑盒压测方案**；仅有 pytest 单元/集成测试（46 文件），无 locust/k6/jmeter/vegeta 任何痕迹。9.2 的单实例容量数字目前为估算值，必须由本节压测实测替换后才可写入对外承诺（9.6 验收规则）。
+
+**目标方案**（落地要求，禁止用"随机输入 + sleep + 只打日志"的伪压测代替）：
+
+1. **工具与目录**：k6（场景编排，主工具）+ hey（冒烟）；新建 `loadtest/` 目录：`loadtest/k6/s1-api-baseline.js`、`s2-task-storm.js`、`s3-polling.js`、`s4-provider-degrade.js`、`s5-soak.js`、`loadtest/baseline/README.md`；
+2. **场景矩阵**（与 9.6 对齐，指标阈值以 1.1 量化目标为判定依据）：
+   - S1 API 基线：400 QPS 混合（70% 读：task_status/列表；30% 写：候选确认/任务提交），阶梯加压至 800 QPS 找拐点 → 目标 P99 读 < 500 ms / 写 < 1.5 s，错误率 < 0.1%；
+   - S2 任务风暴：并发提交 500 视频任务（mock 供应商）→ 验证入队幂等、队列不饿死轻任务（worker 队列拆分后）；
+   - S3 轮询压力：2000 虚拟用户 × 每 3 s 轮询 `task_status` → 验证 Redis 缓存命中率 > 90%、只读库 QPS < 100（5.9）；
+   - S4 供应商劣化注入：mock 供应商 30 s 延迟 / 50% 失败 → 验证熔断、自动换 provider、无级联超时（8.4）；
+   - S5 浸泡：S1 的 60% 负载 × 8 h → 验证无内存/连接泄漏、无从延迟累积；
+3. **验收口径**：以 Prometheus（HTTP 分位数、队列深度、worker 内存）+ task-log（成功率/elapsed_ms）+ RDS 慢查询数共同判定，逐项比对 1.1 目标值；每次结果归档 `loadtest/baseline/<date>-<git-sha>.md`，作为回归门禁（相对基线劣化 > 10% 阻断发布，7.6.1 perf 环境门禁）；
+4. **环境要求**：在 perf 环境（7.6.1）执行——真实 MySQL/Tair + mock 供应商（复用 `tests/support/llm_api_app.py` 扩展为可注入延迟/失败率的 mock 服务），压测客户端与被测系统跨 AZ 部署；数据预灌至生产 6 个月规模（9.3）；禁用真实供应商以隔离成本噪声，但 S4 变体需每季度在 staging 用真实供应商小额配额跑一次出口链路验证。
 
 ---
 
@@ -1946,7 +2056,7 @@ flowchart TD
 
 | # | 不足 | 改进措施 |
 | --- | --- | --- |
-| E1 | **无压测体系** | 建 `loadtest/`（k6）：API 基线 / 任务风暴 / 轮询压力三场景（3.3 指标），接入 CI 夜间执行并留存基线报告 |
+| E1 | **无压测体系** | 建 `loadtest/`（k6）：按 3.9 场景矩阵 S1~S5 落地，接入 CI 夜间执行并留存基线报告（9.6 验收） |
 | E2 | 前端无自动化测试，MSW 仅用于开发 | Vitest 组件测试 + Playwright E2E 覆盖主链路（编辑页→ready→工作室→生成→任务中心） |
 | E3 | 后端测试对 DB 依赖走 skip 兜底，CI 覆盖率不明 | testcontainers 提供真实 MySQL/Redis；覆盖率门禁 ≥ 60% 起步 |
 | E4 | 无 API 契约防退化机制 | CI 加 OpenAPI diff（oasdiff），breaking change 阻断合并 |
