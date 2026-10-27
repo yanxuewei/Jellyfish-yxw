@@ -1239,21 +1239,494 @@ server {
 }
 ```
 
-### 7.3 生产发布与监控灰度策略（阿里云托管方案）
+### 7.3 应用部署形态选择
 
-| 环节 | 方案 |
+| 方案 | 适用 | 说明 |
+| --- | --- | --- |
+| **推荐：ACK + ALB Ingress + stable/canary 双 Deployment** | 生产（PH 主站） | 满足 99.95%（多副本跨 AZ + PDB + `maxUnavailable=0`）、KEDA 按队列深度扩缩 Celery、ALB 金丝雀注解原生支持灰度门禁；清单见 7.4 |
+| 备选：ECS × N + Docker Compose（7.2.2） | 成本敏感、单区域试点、staging | 需自建 nginx 负载均衡与健康摘除；滚动发布靠逐台 `up -d --no-deps`，灰度粒度粗；可用性 ≈ 99.5~99.9%（受单机上限约束） |
+| 不推荐：SAE / 函数计算 FC | — | Celery 长任务（视频 1~10 min、1800 s 超时）与 Serverless 请求超时/冷启动模型不匹配；worker 常驻消费与按请求计费冲突 |
+| 不推荐：单实例 ECS + Compose（现状形态） | 仅本地开发 | 任何滚动发布都是停机；单点故障直接击穿 SLA，无法达成 99.95% |
+
+**Jellyfish 特有的形态约束：**
+
+1. **API 与 worker 必须独立 Deployment**：视频长任务在 worker 侧执行，API 只入队——两者扩缩容驱动指标不同（API 看 QPS/CPU，worker 看队列深度），合并部署会导致资源浪费或互相挤占；
+2. **迁移必须与发布解耦**：`init_db.py`/SQL 迁移作为 ArgoCD **PreSync hook Job** 先行执行，schema 就绪后才滚动新代码（配合 5.6 扩展式迁移规则，旧代码可继续运行，保证 4.5 回滚成立）;
+3. **front 静态站可独立发布**：nginx 容器只依赖 `BACKEND_URL` 运行时注入（env.js），前后端镜像版本可独立灰度与回滚；
+4. **worker 出口需固定 EIP**（NAT 网关）：供应商 API 白名单与 `provider:health` 熔断统计都依赖稳定出口。
+
+### 7.4 ACK 部署清单（YAML）
+
+> 目标态清单（GitOps 仓库 `deploy/aliyun/`，ArgoCD 管理）。镜像地址格式：`registry-vpc.ap-southeast-6.aliyuncs.com/jellyfish/<app>:<git-sha>`（ACR VPC 内网拉取，禁用 latest）。
+
+#### 7.4.1 命名空间、配置与密钥
+
+```yaml
+# deploy/aliyun/00-namespace-config.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jellyfish
+  labels: { "app.kubernetes.io/name": "jellyfish" }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: jellyfish-env, namespace: jellyfish }
+data:
+  # ---- 运行时 ----
+  DEBUG: "false"
+  API_V1_PREFIX: "/api/v1"
+  TZ: "Asia/Manila"                  # 曼谷站点改 Asia/Bangkok；DB 时间戳统一 UTC（见 5.5）
+  CORS_ORIGINS: "https://app.example-ph.com,https://app.example-th.com"
+  # ---- Redis / Celery ----
+  REDIS_HOST: "tair-mnl.redis.rds.aliyuncs.com"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+  CELERY_BROKER_URL: ""              # 留空则由 REDIS_* 拼装（app/config.py 缺省行为）
+  # ---- 对象存储（生产 = OSS，S3 兼容协议不变，仅换 endpoint）----
+  S3_ENDPOINT_URL: "https://oss-ap-southeast-6-internal.aliyuncs.com"   # 内网 endpoint 免流量费
+  S3_REGION_NAME: "ap-southeast-6"
+  S3_BUCKET_NAME: "jellyfish-mnl-media"
+  S3_BASE_PATH: "prod"
+  S3_PUBLIC_BASE_URL: "https://media-cdn.example-ph.com"                # CDN 域名，非 OSS 直链
+  # ---- 可观测（目标态，见 10.2 O2/O3）----
+  LOG_FORMAT: "json"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://arms-collector.jellyfish:4317"
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: jellyfish-secret, namespace: jellyfish }
+type: Opaque
+stringData:
+  # 下列值由 KMS 凭据管家经 ExternalSecret / RRSA 注入，禁止写进 Git（见 10.1 S4）
+  DATABASE_URL: "mysql+aiomysql://jellyfish:REPLACE_ME@rm-mnl-jellyfish.mysql.rds.aliyuncs.com:3306/jellyfish"
+  DATABASE_READ_URL: "mysql+aiomysql://jellyfish_ro:REPLACE_ME@rr-mnl-jellyfish.mysql.rds.aliyuncs.com:3306/jellyfish"
+  REDIS_PASSWORD: "REPLACE_ME"
+  S3_ACCESS_KEY_ID: "REPLACE_ME"        # 目标态：RRSA 免 AK 访问 OSS，boto3 走 STS
+  S3_SECRET_ACCESS_KEY: "REPLACE_ME"
+  OPENAI_API_KEY: "REPLACE_ME"          # 供应商 key 真相在 DB providers 表（KMS 加密），env 仅兜底
+```
+
+> **供应商密钥不进 ConfigMap**：Jellyfish 的 provider api_key/secret 存 `providers` 表（现状明文，改进为 KMS 加密列，见 10.1 S4），换 key 是 DB 操作而非发布操作——这是与 new-api 类网关不同的关键点，密钥轮转不需要滚动 Pod。
+
+#### 7.4.2 数据库迁移 Job（ArgoCD PreSync，先于一切滚动）
+
+```yaml
+# deploy/aliyun/05-job-migrate.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jellyfish-migrate-APP_VERSION
+  namespace: jellyfish
+  annotations:
+    argocd.argoproj.io/hook: PreSync          # 同步前执行，失败即中止发布
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 1                              # 迁移失败不盲重试，人工介入
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: registry-vpc.ap-southeast-6.aliyuncs.com/jellyfish/backend:CANDIDATE_SHA
+          command: ["uv", "run", "alembic", "upgrade", "head"]   # 目标态；现状过渡期为 init_db.py + sql/*.sql 幂等重放
+          envFrom:
+            - configMapRef: { name: jellyfish-env }
+            - secretRef: { name: jellyfish-secret }
+          resources: { requests: { cpu: 250m, memory: 512Mi }, limits: { cpu: "1", memory: 1Gi } }
+```
+
+> 迁移只允许**扩展式变更**（5.6）；Job 成功后 stable 旧版本仍可运行，任何时刻可执行 4.5 回滚而无需回退 schema。
+
+#### 7.4.3 backend stable / canary 双 Deployment
+
+```yaml
+# deploy/aliyun/10-deployment-backend-stable.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-stable
+  namespace: jellyfish
+  labels: { app: backend, track: stable }
+spec:
+  replicas: 3                        # 跨 2 AZ；单 AZ 故障仍有 ≥1.5 副本承载（9.5 的 1.5 倍不变量）
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }   # 0 不可用是 99.95% 的前提
+  selector:
+    matchLabels: { app: backend, track: stable }
+  template:
+    metadata:
+      labels: { app: backend, track: stable }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"        # 需补建 instrumentator（10.2 O2）
+    spec:
+      serviceAccountName: jellyfish           # RRSA 绑定：OSS / SLS / KMS 免 AK
+      terminationGracePeriodSeconds: 60
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: { matchLabels: { app: backend } }
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: { matchLabels: { app: backend } }
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: backend
+          image: registry-vpc.ap-southeast-6.aliyuncs.com/jellyfish/backend:STABLE_SHA
+          imagePullPolicy: IfNotPresent
+          command: ["uv", "run", "uvicorn", "app.main:app",
+                    "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+          ports:
+            - { containerPort: 8000, name: http }
+          envFrom:
+            - configMapRef: { name: jellyfish-env }
+            - secretRef: { name: jellyfish-secret }
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }      # 目标态换 /health/ready（探测 DB/Redis/OSS，10.2 O3）
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2                          # 快速摘流
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }       # 目标态换 /health/live（轻量，不查依赖）
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 3
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }       # 覆盖启动注册（bootstrap provider+adapter）耗时
+            failureThreshold: 30
+            periodSeconds: 2
+          resources:
+            requests: { cpu: "1", memory: 2Gi, ephemeral-storage: 10Gi }
+            limits:   { cpu: "2", memory: 4Gi }
+          lifecycle:
+            preStop:
+              exec: { command: ["/bin/sh", "-c", "sleep 15"] }   # 等 ALB 摘除后端再收 SIGTERM
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: backend-stable, namespace: jellyfish }
+spec:
+  minAvailable: 2                    # 3 副本允许 1 个维护性驱逐
+  selector: { matchLabels: { app: backend, track: stable } }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: backend-stable, namespace: jellyfish }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: backend-stable }
+  minReplicas: 3
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 60 } }
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies: [ { type: Pods, value: 1, periodSeconds: 120 } ]
+```
+
+```text
+canary 与 stable 的唯一差异：labels/track=canary、replicas=1、PDB minAvailable=1、
+镜像为 CANDIDATE_SHA、ALB 服务器组独立、不打 HPA（权重由灰度 Ingress 控制）。
+发布顺序：migrate Job → canary 1 副本就绪 → ALB 权重 5% → 门禁 → stable 滚动 → canary 归零保留 24h 热回滚位。
+```
+
+#### 7.4.4 Celery worker：按队列拆分 + KEDA 队列深度扩缩
+
+```yaml
+# deploy/aliyun/11-deployment-worker-video.yaml（视频长任务独立池，防阻塞轻任务，10.4 T2）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-video
+  namespace: jellyfish
+  labels: { app: worker, queue: video }
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }   # 在途任务由 acks_late + reaper 兜底，仍要求 0 不可用
+  selector:
+    matchLabels: { app: worker, queue: video }
+  template:
+    metadata:
+      labels: { app: worker, queue: video }
+    spec:
+      serviceAccountName: jellyfish
+      terminationGracePeriodSeconds: 1900               # > 任务硬超时 1800s：SIGTERM 后允许在途任务收尾
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: { matchLabels: { app: worker } }
+      containers:
+        - name: worker
+          image: registry-vpc.ap-southeast-6.aliyuncs.com/jellyfish/backend:STABLE_SHA
+          command: ["uv", "run", "celery", "-A", "app.core.celery_app:celery_app",
+                    "worker", "-l", "info", "-Q", "queue:video",
+                    "-c", "4", "--max-tasks-per-child", "100"]
+          envFrom:
+            - configMapRef: { name: jellyfish-env }
+            - secretRef: { name: jellyfish-secret }
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits:   { cpu: "2", memory: 4Gi }         # 帧图 base64 物化是内存峰值来源（5.5 D6）
+          livenessProbe:                               # celery inspect ping 周期探活
+            exec:
+              command: ["uv", "run", "celery", "-A", "app.core.celery_app:celery_app", "inspect", "ping", "-t", "10"]
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            timeoutSeconds: 15
+            failureThreshold: 3
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: { name: worker-video, namespace: jellyfish }
+spec:
+  scaleTargetRef: { name: worker-video }
+  minReplicaCount: 3
+  maxReplicaCount: 16                                   # 9.2 峰值并发视频任务 400 / (4 槽位×副本) 的弹性上限
+  cooldownPeriod: 300
+  triggers:
+    - type: redis
+      metadata:
+        addressFromEnv: "REDIS_HOST:REDIS_PORT"
+        passwordFromEnv: "REDIS_PASSWORD"
+        listName: "queue:video"
+        listLength: "100"                               # 每副本目标积压 ≤ 100（9.5 触发阈值）
+---
+# worker-light（图片/文本队列）同构：-Q queue:image,queue:text，-c 16，
+# replicas 2、KEDA min 2 / max 8、listLength 200；轻任务池与视频池资源隔离，
+# 视频风暴时图片任务 P95 不受影响（9.6 S2 验收项）。
+```
+
+#### 7.4.5 front Deployment 与 Service
+
+```yaml
+# deploy/aliyun/12-deployment-front.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: front
+  namespace: jellyfish
+  labels: { app: front }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: front } }
+  template:
+    metadata: { labels: { app: front } }
+    spec:
+      containers:
+        - name: front
+          image: registry-vpc.ap-southeast-6.aliyuncs.com/jellyfish/front:STABLE_SHA
+          ports: [ { containerPort: 80, name: http } ]
+          env:
+            - name: BACKEND_URL            # entrypoint 生成 env.js → window.__ENV（镜像与环境解耦）
+              value: "https://api.example-ph.com/api"
+          readinessProbe: { httpGet: { path: /, port: 80 }, periodSeconds: 5 }
+          resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { cpu: 500m, memory: 256Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: backend, namespace: jellyfish }
+spec:
+  selector: { app: backend }           # 同时选中 stable+canary；灰度权重由 ALB Ingress 服务器组控制
+  ports: [ { port: 80, targetPort: 8000 } ]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: front, namespace: jellyfish }
+spec:
+  selector: { app: front }
+  ports: [ { port: 80, targetPort: 80 } ]
+```
+
+#### 7.4.6 AlbConfig 与 ALB Ingress（含金丝雀灰度）
+
+```yaml
+# deploy/aliyun/20-alb-ingress.yaml
+apiVersion: alibabacloud.com/v1
+kind: AlbConfig
+metadata: { name: jellyfish-alb }
+spec:
+  config:
+    name: jellyfish-alb-mnl
+    addressType: Internet
+    addressAllocatedMode: Dynamic
+    zoneMappings:                       # 至少 2 AZ，是 8.2 可用性推导的前提
+      - { vSwitchId: vsw-az-a-REPLACE_ME }
+      - { vSwitchId: vsw-az-b-REPLACE_ME }
+  listeners:
+    - { port: 443, protocol: HTTPS, certificates: [ { CertificateId: REPLACE_ME } ] }
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata: { name: jellyfish-alb }
+spec:
+  controller: ingress.k8s.alibabacloud/alb
+  parameters:
+    apiGroup: alibabacloud.com
+    kind: AlbConfig
+    name: jellyfish-alb
+---
+# 主 Ingress：全部流量 → stable（不带 canary 注解）
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jellyfish-main
+  namespace: jellyfish
+  annotations:
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/healthcheck-path: "/health"
+    alb.ingress.kubernetes.io/backend-scheduler: "wrr"
+spec:
+  ingressClassName: jellyfish-alb
+  rules:
+    - host: api.example-ph.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: backend, port: { number: 80 } } } }
+    - host: app.example-ph.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: front, port: { number: 80 } } } }
+---
+# 灰度 Ingress：canary 注解必须在独立 Ingress 上；权重由 GitOps 逐步改 5 → 25 → 50 → 100
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jellyfish-canary
+  namespace: jellyfish
+  annotations:
+    alb.ingress.kubernetes.io/canary: "true"
+    alb.ingress.kubernetes.io/canary-weight: "5"
+    alb.ingress.kubernetes.io/canary-by-header: "X-Canary"        # 内部白名单先行验证（4.3）
+    alb.ingress.kubernetes.io/canary-by-header-value: "true"
+spec:
+  ingressClassName: jellyfish-alb
+  rules:
+    - host: api.example-ph.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: backend-canary, port: { number: 80 } } } }
+```
+
+> **Celery worker 的灰度不走 ALB**（worker 不接 HTTP 流量）：按 4.3 时序，API 侧按 `project_id hash` 把灰度比例内的新任务投递 `queue:v2`，新版本 worker 消费 v2、旧版本排空 v1 后下线；`generation_tasks.executor_type/executor_task_id` 保证两代 worker 状态写回同一真相层。
+
+### 7.5 发布流水线与发布集成
+
+```mermaid
+flowchart LR
+  A["PR 合并 main"] --> B["CI: pylint + pytest<br/>tsc --noEmit + openapi:gen diff<br/>commit-msg 校验（现有 workflows）"]
+  B --> C["构建镜像（ghcr-images.yml 现有）<br/>tag = git sha"]
+  C --> D["同步 ACR Manila（VPC 内网拉取）<br/>+ cosign 签名"]
+  D --> E["迁移预演：对生产快照影子库<br/>alembic upgrade head 跑两次<br/>验证幂等与前向兼容"]
+  E --> F{"Schema 兼容检查<br/>禁止同窗口破坏性变更（5.6）"}
+  F -->|不通过| G["阻断发布<br/>拆分为兼容发布 + 清理发布"]
+  F -->|通过| H["GitOps 提交：canary 镜像 sha<br/>ArgoCD 自动同步"]
+  H --> I["PreSync: migrate Job（7.4.2）"]
+  I --> J["canary 1 副本 startup/readiness 通过"]
+  J --> K["ALB 权重 5% + X-Canary 白名单"]
+  K --> L{"自动门禁 30min<br/>5xx / P99 / 任务成功率 / 取消收敛"}
+  L -->|失败| M["权重归零 + P1 告警（4.5 回滚时序）"]
+  M --> N["人工研判：回滚或前向修复"]
+  L -->|通过| O["权重 25 → 50 → 100"]
+  O --> P["stable 滚动升级 maxUnavailable=0"]
+  P --> Q["worker 灰度：queue:v2 比例同步放量<br/>v1 排空后下线旧 worker"]
+  Q --> R["canary 归零权重，保留 24h 热回滚位"]
+  R --> S["发布记录：镜像 sha、迁移版本、<br/>Nacos 配置变更清单 → site/content/blog release note"]
+```
+
+**发布窗口与冻结策略**：发布窗口固定 **马尼拉/曼谷时间 02:00–05:00**（当地低峰）；避开菲律宾发薪日（每月 15/30 日）与 PH/TH 公共假期前夜（短剧消费高峰）；错误预算燃尽 > 80% 自动冻结非必要发布（8.3）。
+
+**配置与备份策略**（随发布集成管理）：
+
+| 项 | 方案 |
 | --- | --- |
-| 镜像 | GitHub Actions（现有 `ghcr-images.yml`）→ 同步至阿里云 **ACR 企业版**（Manila），语义化 tag，禁用 latest 部署 |
-| 编排 | **ACK 托管版**：backend/celery/front 各为 Deployment，HPA（CPU 60% 或队列深度指标）弹性扩缩；Celery 用 KEDA 按 Redis 队列长度扩缩容 |
-| 发布 | ALB Ingress 金丝雀注解（`canary-weight: 5→25→50→100`），配合 4.3 灰度时序；发布窗口避开 PH/TH 业务高峰（当地 19:00–23:00） |
-| 配置 | 环境变量走 ACK Secret + Nacos（动态配置：默认模型、供应商开关、限流阈值可热更） |
-| 监控 | ARMS Prometheus 托管采集（替代自建 prometheus）+ Grafana 服务；SLS 采集容器日志；CloudMonitor 告警对接钉钉/电话（4.2 规则） |
-| 备份 | RDS 自动备份（每日全量 + binlog，保留 30 天，PITR）；OSS 版本化 + 跨区域复制（可选复制 Bangkok）；etcd/ACK 集群自动备份 |
-| 演练 | 每季度：AZ 故障切换演练、RDS 主备切换演练、回滚演练（4.5 时序）、限流压测（k6） |
+| 动态配置 | Nacos：默认模型（`model_settings`）、供应商开关（`providers.status`）、限流阈值、灰度开关热更 ≤ 60 s，变更走审计 |
+| 备份 | RDS 每日全量 + binlog（保留 30 天，PITR）；OSS 版本化 + 跨区域复制 Bangkok（可选）；ACK 集群 etcd 自动备份；GitOps 仓库即配置备份 |
+| 镜像保留 | ACR 保留最近 30 个 tag（≥ 90 天），保证任意历史版本可回滚重建 |
 
-### 7.4 SLA 与容量总览
+### 7.6 环境矩阵与发布验证（详细方案）
 
-SLA 99.95% 的度量口径、可用性推导、错误预算管理、故障域韧性设计与灾备演练详见**第 8 章**；业务容量模型、各层容量核算、扩缩容触发条件与压测验收标准详见**第 9 章**。部署形态（7.1~7.3）是二者的载体：多副本跨 AZ、RDS 高可用、Tair 主从是达成 99.95% 的最低配置前提。
+#### 7.6.1 环境矩阵
+
+| 环境 | 位置/形态 | 数据与依赖 | 用途 | 晋级门禁 |
+| --- | --- | --- | --- | --- |
+| dev | 本地 Compose（7.2.1，SQLite/MySQL + RustFS + mock provider） | 种子数据 | 功能开发 | `uv run pylint app`、`uv run pytest`、`pnpm exec tsc --noEmit` 全绿 |
+| ci | GitHub Actions（现有 5 条 workflow + 目标态补充） | 无状态 | 静态检查/单测/契约 | 单测通过 + OpenAPI diff 无 breaking（E4）+ 镜像构建成功 |
+| staging | Manila ACK 独立 namespace `jellyfish-staging`（1 副本 backend/worker） | RDS MySQL 测试实例 + Tair 测试实例 + OSS 测试 bucket；LLM 用 `tests/support/llm_api_app.py` mock + 少量真实供应商配额 | 集成验证、E2E、迁移预演 | 迁移预演幂等通过 + 冒烟用例（7.6.3）全过 + E2E 主链路通过 |
+| perf | 复用 staging 拓扑 + k6 压测机 + mock 供应商（可注入延迟/失败） | 数据量预灌至生产 6 个月规模 | 第 9 章 S1~S5 压测 | 相对上次基线劣化 > 10% 阻断发布 |
+| prod-mnl | Manila ACK（7.4 全清单） | RDS HA + Tair 主从 + OSS + 双供应商 | 菲律宾流量 | 灰度门禁（7.6.4）→ 全量 |
+| prod-bkk（未来） | Bangkok ACK（TH 用户占比 > 40% 时启用） | 独立全套，数据不出境（PDPA） | 泰国流量 | 与 mnl **错峰发布**（先 mnl 稳定 48h 后 bkk） |
+| dr | Bangkok 冷备（RDS 跨区备份 + OSS 跨区复制 + GitOps 一键重建） | 备份数据 | 区域级灾备 | 每季度切换演练（8.6） |
+
+#### 7.6.2 发布验证阶段（V0~V5，每阶段有明确出口条件）
+
+| 阶段 | 时机 | 验证内容 | 出口条件 | 失败动作 |
+| --- | --- | --- | --- | --- |
+| V0 制品校验 | CI 产出后 | 镜像 tag = git sha、cosign 签名验证、`kustomize/helm diff` 人工评审清单变更 | 签名有效 + diff 双人审批 | 阻断进入 staging |
+| V1 迁移预演 | staging | 生产快照影子库上 `alembic upgrade head` **连跑两次**；校验旧版本代码可在新 schema 上运行（前向兼容） | 两次结果一致 + 旧镜像启动正常 | 拆分为兼容发布 + 清理发布 |
+| V2 部署校验 | staging → prod canary | Pod 全部 Ready、startupProbe 通过、无 CrashLoop、`/health` 200、日志无 ERROR 突增、`bootstrap` provider/adapter 注册完整 | 5 min 观察窗全绿 | 中止发布，镜像回退 |
+| V3 冒烟验证 | canary 就绪后 | 7.6.3 自动化冒烟用例（canary 与 stable 各跑一遍，对比行为一致性） | 用例 100% 通过 | 权重归零回滚 |
+| V4 灰度门禁 | 权重 5% 起 30 min | 7.6.4 指标表自动对比 canary vs stable | 全部指标在阈值内 | 自动权重归零 + P1 告警（4.5） |
+| V5 全量回归 | 100% 后 24 h | E2E 主链路（编辑页→ready→工作室→生成→任务中心）、任务对账（无悬挂 running）、SLO 大盘无劣化、release note 落 `site/content/blog` | 24 h 观察期结束 | 24 h 内保留 canary 热回滚位 |
+
+#### 7.6.3 自动化冒烟用例（V3，staging 与 prod canary 共用）
+
+| # | 用例 | 端点/操作 | 断言 |
+| --- | --- | --- | --- |
+| 1 | 健康检查 | `GET /health` | 200，响应 < 500 ms |
+| 2 | OpenAPI 契约 | `GET /openapi.json` | schema 可解析，与 CI 产物 hash 一致 |
+| 3 | 项目创建 | `POST /api/v1/studio/projects` | 200，`ApiResponse.code` 成功语义 |
+| 4 | 章节拆分（mock LLM） | `POST /api/v1/script_processing`（拆分） | shots 落库，`status=pending` |
+| 5 | 候选提取与确认 | 抽取 → accept 一个资产候选 | 候选进入正式资产表，`shot_character_links` 建立 |
+| 6 | shot ready 流转 | 完成全部确认 → readiness 检查 | `shots.status=ready` |
+| 7 | 图片任务提交（mock provider） | `POST /api/v1/film` 图片生成 | 202 + `task_id`，DB `pending→running→succeeded` |
+| 8 | 任务轮询 | `GET /api/v1/film/task_status` | 状态/进度单调推进，P99 < 200 ms |
+| 9 | 任务取消 | 提交长任务 → cancel | `cancel_requested` 置位，终态 `cancelled`（双通道收敛，6.3） |
+| 10 | 文件上传下载 | 上传素材 → OSS → 读取 | object_key 可访问，`file_usages` 引用正确 |
+| 11 | 视频就绪检查 | `video-readiness`（缺帧图场景） | 返回缺失项清单而非 500 |
+| 12 | 限流行为（prod 开启后） | 超频调用 `task_status` | 429 + `retry_after`，不产生 5xx |
+
+> 用例 4/7 在 staging 用 mock 供应商；prod canary 用**真实供应商小额配额**跑一次真实图片生成（用例 7 变体），验证出口 EIP、供应商凭据与能力表在生产环境可用——这是 staging 无法覆盖的关键差异点。
+
+#### 7.6.4 灰度门禁指标（V4，自动对比 canary vs stable）
+
+| 指标 | 数据源 | 中止阈值（任一触发即自动回滚） |
+| --- | --- | --- |
+| HTTP 5xx 比例 | ALB 访问日志 / Prometheus | canary > stable + 0.5pp 或绝对值 > 1% |
+| API P99 延迟 | Prometheus histogram | canary > stable × 1.3 且绝对值 > 2 s |
+| 任务提交成功率 | task-log（started 事件/请求数） | canary < stable − 2pp |
+| 任务执行成功率（同 task_kind 维度） | `generation_tasks` 终态统计 | canary < stable × 0.8 |
+| 取消收敛率 | cancelled 终态 vs cancel_requested | 存在 > 5 min 未收敛任务即告警 |
+| Panic/未捕获异常 | SLS `level=ERROR` 关键字 | canary 新增异常签名（相对 stable）≥ 1 种 |
+| Pod 重启次数 | K8s event | canary 重启 ≥ 2 次 |
+
+### 7.7 监控集成（阿里云侧）
+
+| 数据面 | 阿里云产品 | 接入方式 | 保留 |
+| --- | --- | --- | --- |
+| 指标 | ARMS Prometheus 版 | ACK 装 arms-prometheus 组件，ServiceMonitor 抓 backend `/metrics`（需补建 instrumentator，10.2 O2）+ celery-exporter | 90 天热 + 降采样 |
+| 日志 | SLS | Logtail DaemonSet 采容器 stdout（JSON），四 logstore 分流（4.1） | 热 30 天 / 冷 180 天 |
+| 链路 | ARMS / OTel | OTel SDK 贯通 API → Celery headers → 供应商调用（trace_id 透传，4.1） | 30 天 |
+| 看板 | Grafana 托管版 | 三块大盘：SLA/SLO 燃尽（8.3）、生成链路健康（task_kind × provider）、容量与成本（9.5 指标） | — |
+| 拨测 | 云监控站点监控 | 探测点：马尼拉、曼谷、新加坡；探测 `/health` + 关键只读 API；断言 200 与响应体版本字段 | 15 个月 |
+| 前端 RUM | ARMS RUM | front 注入 SDK：页面性能、JS 错误、任务中心轮询失败率（PH/TH 分地域） | 30 天 |
+| 告警 | ARMS 告警 + 云监控 | 规则见 4.2 表；P1 电话 + 钉钉，P2 钉钉群；值班表轮转 | — |
+| 审计合规 | ActionTrail + RDS SQL 洞察 | 云 API 变更全留痕；慢 SQL/异常 SQL 审计（5.4 治理闭环） | 180 天 |
+
+### 7.8 SLA 与容量总览
+
+SLA 99.95% 的度量口径、可用性推导、错误预算管理、故障域韧性设计与灾备演练详见**第 8 章**；业务容量模型、各层容量核算、扩缩容触发条件与压测验收标准详见**第 9 章**。部署形态（7.3~7.4）是二者的载体：多副本跨 AZ、RDS 高可用、Tair 主从是达成 99.95% 的最低配置前提。
 
 ---
 
@@ -1292,7 +1765,7 @@ SLA 99.95% 的度量口径、可用性推导、错误预算管理、故障域韧
 
 1. 读路径（任务轮询/列表）走只读实例 + Redis 2 s 缓存，**Redis 故障时缓存穿透到只读库而非报错**（降级放行）；
 2. 生成链路（Celery → 供应商）与 API 链路完全异步解耦（当前架构已满足），供应商慢/挂不拖垮 API；
-3. 消除单点：现状 compose 单机形态 ≈ 99.5%（不达标），生产必须 7.1/7.3 的多副本跨 AZ 形态；
+3. 消除单点：现状 compose 单机形态 ≈ 99.5%（不达标），生产必须 7.3/7.4 的多副本跨 AZ ACK 形态；
 4. 留 ~0.03% 预算给"人因与变更"（业界最大故障源），靠灰度 + 自动回滚（4.3/4.5）压缩。
 
 ### 8.3 错误预算管理
@@ -1477,8 +1950,8 @@ flowchart TD
 | E2 | 前端无自动化测试，MSW 仅用于开发 | Vitest 组件测试 + Playwright E2E 覆盖主链路（编辑页→ready→工作室→生成→任务中心） |
 | E3 | 后端测试对 DB 依赖走 skip 兜底，CI 覆盖率不明 | testcontainers 提供真实 MySQL/Redis；覆盖率门禁 ≥ 60% 起步 |
 | E4 | 无 API 契约防退化机制 | CI 加 OpenAPI diff（oasdiff），breaking change 阻断合并 |
-| E5 | 部署仍依赖 ghcr.io（PH/TH 拉取慢且受网络影响） | 镜像同步 ACR Manila（7.3）；部署走 GitOps（ArgoCD），杜绝手工 compose up 生产 |
-| E6 | compose 单机形态无高可用 | 按 7.1/7.3 迁移 ACK 多副本跨 AZ；compose 仅保留 staging/本地用途 |
+| E5 | 部署仍依赖 ghcr.io（PH/TH 拉取慢且受网络影响） | 镜像同步 ACR Manila（7.5）；部署走 GitOps（ArgoCD），杜绝手工 compose up 生产 |
+| E6 | compose 单机形态无高可用 | 按 7.3/7.4 迁移 ACK 多副本跨 AZ；compose 仅保留 dev/staging 用途 |
 | E7 | 无用户/多租户模型，项目数据无隔离 | 随 S1 认证一并引入 user/tenant 维度与行级隔离，为多团队协作与计费打基础 |
 | E8 | 文档站 plans 中多项计划未落地（生成链收敛重构等） | 按 AGENTS.md 约定保持 plans 与代码同步；本文件 10.4/10.1 与其对齐排期 |
 
