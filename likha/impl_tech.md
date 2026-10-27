@@ -3,7 +3,7 @@
 > 版本：v1.0 ｜ 日期：2026-10-27 ｜ 适用范围：Jellyfish（AI Short Drama Studio）
 > 目标读者：架构师、后端/前端开发、SRE、测试
 > 部署目标：阿里云（主区域菲律宾 Manila `ap-southeast-6`，就近服务泰国 Bangkok `ap-southeast-7`）
-> SLA 目标：**99.95%**（月度不可用时长 ≤ 21.9 分钟）
+> SLA 目标：**99.95%**（月度不可用预算 ≤ 21.6 分钟）
 
 ---
 
@@ -16,8 +16,10 @@
 5. [数据存储结构设计](#5-数据存储结构设计)
 6. [核心业务逻辑时序图](#6-核心业务逻辑时序图)
 7. [完整部署方案（阿里云 + Docker Compose）](#7-完整部署方案阿里云--docker-compose)
-8. [系统不足与改进措施](#8-系统不足与改进措施)
-9. [附录](#9-附录)
+8. [SLA 99.95% 达成方案](#8-sla-9995-达成方案)
+9. [容量设计与压测验收](#9-容量设计与压测验收)
+10. [系统不足与改进措施](#10-系统不足与改进措施)
+11. [附录](#11-附录)
 
 ---
 
@@ -42,6 +44,20 @@ Jellyfish 是一个端到端的 AI 短剧生产工作台，覆盖「剧本输入
 - 单部短剧 ≈ 80~120 章节 × 每章 5~15 分镜；单分镜产生 1~4 个生成任务；
 - 视频生成为长任务（1~10 分钟/个），是系统吞吐与稳定性的主要压力源；
 - API QPS 峰值预估 200~400（含前端任务轮询），对象存储日增量 50~200 GB（帧图/视频）。
+
+### 1.1 设计目标与量化指标
+
+| 维度 | 目标值 | 校验方式 |
+| --- | --- | --- |
+| 可用性 SLA | ≥ **99.95%**（月度不可用预算 ≤ 21.6 分钟） | SLO 燃尽图 + `/health` 外部拨测（PH/TH 双探测点） |
+| API 延迟 | 读路径 P99 ≤ 500 ms；写路径 P99 ≤ 1.5 s（不含 LLM 同步调用） | ARMS Prometheus 分位数 + 压测基线（第 9 章） |
+| LLM 同步端点 | `/script_processing` 任务化后端到端 P95 ≤ 90 s（Agent 编排耗时） | task-log elapsed_ms 统计 |
+| 单实例容量 | API 实例 ≥ 400 QPS；单 Celery worker ≥ 4 并发视频长任务 | k6 压测实测替换（见 9.2） |
+| 任务正确性 | 任务不重复执行、不丢状态；取消收敛率 100% | task_id 幂等键 + reaper 对账（见 10.4） |
+| 生成成功率 | 业务 SLO ≥ 95%（与平台 SLA 分离计量） | 按 task_kind/provider 维度指标 |
+| 故障恢复 | 发布回滚 RTO ≤ 5 min；RPO ≤ 5 min（binlog）；区域灾难 RTO ≤ 4 h | 季度演练（见 8.6） |
+| 区域延迟 | PH 用户 RTT ≤ 15 ms；TH 用户经 CDN/GA 后 API RTT ≤ 100 ms | 拨测 |
+| 配置收敛 | 默认模型/供应商切换生效 ≤ 60 s | 灰度开关演练 |
 
 ---
 
@@ -694,7 +710,116 @@ erDiagram
 2. **候选确认模型**：AI 抽取结果先进 `shot_extracted_candidates` / `shot_extracted_dialogue_candidates`（候选态），用户在分镜编辑页 accept/ignore/link 后才落正式资产表——保证 AI 输出必须经人工确认，避免污染一致性资产。
 3. **资产链接三级挂载**：`project_*_links` 支持 project/chapter/shot 三级作用域，实现「项目级默认 + 章节/镜头级覆盖」的一致性管理。
 4. **多态文件引用**：`files` + `file_usages` 解耦存储与业务，任何实体（帧图、资产图、视频、素材）通过 usage 关联，便于生命周期管理与孤儿文件清理（`scripts/backfill_file_usages.py` 为回填工具）。
-5. **迁移策略**：手写编号 SQL（001~008）按序执行，`init_db.py` 负责 `create_all` 建表。生产态需引入 Alembic 版本化迁移（见第 8 章）。
+5. **迁移策略**：手写编号 SQL（001~008）按序执行，`init_db.py` 负责 `create_all` 建表。生产态需引入 Alembic 版本化迁移（见 5.6 与第 10 章 D1）。
+
+### 5.4 索引设计要点（按真实查询模式）
+
+> 现状：建表依赖 `create_all` + 手写 SQL，**索引未按查询模式系统设计**（MySQL 仅对外键自动建索引）。以下为目标态索引清单，落地时以慢查询日志验证。
+
+| 表 | 索引 | 服务的查询 | 优先级 |
+| --- | --- | --- | --- |
+| `shots` | `(chapter_id, index)` 唯一 | 分镜编辑页/工作室按章节列镜头（最高频查询） | P0 |
+| `shot_details` | `shot_id` 唯一 | 1:1 详情联查 | P0 |
+| `generation_tasks` | `(status, created_at)` | reaper 扫描悬挂 `running` 任务、按状态过滤 | P0 |
+| `generation_tasks` | `(task_kind, status, created_at)` | 业务统计（成功率/耗时按 kind 维度）、任务中心筛选 | P1 |
+| `generation_tasks` | `(created_at, id)` | 任务列表 keyset 分页（防深分页 OFFSET 扫描） | P1 |
+| `generation_task_links` | `(link_type, link_id)` | 实体反查任务（镜头维度任务列表，前端轮询入口） | P0 |
+| `generation_task_links` | `task_id` | 任务→实体正查 | P0 |
+| `shot_extracted_candidates` / `shot_extracted_dialogue_candidates` | `(shot_id, status)` | 编辑页待确认候选列表 | P0 |
+| `file_usages` | `(file_id)`、`(usage_type, ref_id)` | 多态引用正/反查、孤儿文件 GC 扫描 | P1 |
+| `files` | `object_key` 唯一 | 上传去重、S3 key 反查 | P1 |
+| `shot_frame_images` | `(shot_id, frame_type)` | 关键帧齐备性检查（video-readiness 判定路径） | P0 |
+| `shot_character_links` | `(shot_id)`、`(character_id)` | 镜头↔角色双向查询 | P1 |
+| `models` | `(provider_id, category)` | 模型管理列表、默认模型解析 | P1 |
+| `chapters` | `(project_id, index)` | 章节列表 | P1 |
+
+**慢查询治理**：RDS 慢日志阈值 1 s → SLS 每日聚合 Top10 → 月度索引评审；任务中心轮询类查询必须命中 `(link_type, link_id)` 或走只读实例 + Redis 缓存（见 5.9）。
+
+### 5.5 主键 / 时间戳 / 软删除与大字段约定
+
+| 约定 | 规则 |
+| --- | --- |
+| 主键 | 统一 `bigint` 自增；不使用业务字段作主键 |
+| 时间戳 | `created_at` / `updated_at` 统一 `DATETIME(3)` **UTC 存储**，展示层按用户时区（PHT/ICT）转换；任务耗时统计一律用 `elapsed_ms`（task_logging 已有） |
+| 软删除 | 业务资产（角色/场景/道具/服装）**不做物理删除**，用候选 `ignored` 标记与链接解除表达"删除"；`files` 由 GC 任务按 `file_usages` 引用计数清理，禁止业务代码直接删 OSS 对象 |
+| JSON 大字段 | `generation_tasks.payload/result`、`projects.stats`、`shot_details.action_beats` 为 JSON 列。**风险**：`VideoGenerationInput` 含 first/last/key 帧 `base64`，若原样快照进 payload，单行可达数 MB，导致表膨胀与主从复制延迟——**payload 中 base64 必须替换为 `file_id/object_key` 引用**，提交时再物化（改进项，见 10.3 D6） |
+| 枚举 | `status`/`task_kind`/`delivery_mode` 用短字符串 + 应用层枚举校验（现状），禁止用 MySQL ENUM（迁移不友好） |
+| 字符集 | 全库 `utf8mb4`（compose mysql-init-sql 已强制 `--default-character-set=utf8mb4`），支持泰文/菲律宾语内容与 emoji |
+
+### 5.6 迁移与版本化策略
+
+**现状与风险：**
+
+```text
+现状链路：init_db.py (Base.metadata.create_all)  →  mysql-init-sql 容器按文件名顺序执行 backend/sql/001~008-*.sql
+```
+
+| 风险 | 说明 |
+| --- | --- |
+| 无版本记录表 | SQL 是否已执行只靠"容器只跑一次"的编排假设；重放非幂等 SQL（如 ADD COLUMN）会失败 |
+| 双轨漂移 | `create_all`（models 定义）与手写 SQL 两套 schema 来源可能不一致，新环境 vs 存量环境结构漂移 |
+| 无 down 迁移 | 无法回退，只能靠备份恢复 |
+| 无 CI 校验 | 迁移脚本不在 CI 中重放验证 |
+
+**目标态（Alembic 收编）：**
+
+1. 以当前 `models/` + 001~008 合并结果生成 Alembic **基线版本**（`alembic revision --autogenerate` 后人工校对）；
+2. `alembic_version` 表成为唯一版本真相，`init_db.py` 退化为「alembic upgrade head」；
+3. CI 增加迁移重放测试：空库 → head、基线库 → head 两条路径都必须通过；
+4. 发布顺序强约束：**先迁移（扩展式）→ 灰度新代码 → 全量**；破坏性变更（删列/改类型）延后一个版本，保证 4.5 回滚时序中「DB 不回滚 schema」成立；
+5. worker 与 API 混版本期间，双方必须兼容 `schema_version` 前后各一个版本。
+
+### 5.7 数据容量估算与治理（写入放大 / 归档 / 分页）
+
+**行数与存储增长估算**（按 1 章业务量假设：日均新增 20 个项目 × 80 章 × 10 镜头；每镜头平均 3 个生成任务、30% 重试）：
+
+| 表 | 日增行数 | 单行估算 | 月增量 | 治理策略 |
+| --- | --- | --- | --- | --- |
+| `shots` + `shot_details` | 1.6 万 × 2 | 0.5~2 KB（提示词文本） | ~1.5 GB | 无需分表；深分页用 keyset |
+| `shot_extracted_candidates`（含对白候选） | ~8 万 | 0.3~1 KB | ~1.5 GB | 已确认/忽略候选 90 天后归档表或压缩 |
+| `generation_tasks` | ~7 万 | 2~10 KB（payload 快照，base64 引用化后 ≤ 2 KB） | 4~15 GB | **完成态任务 30 天后 payload/result 转存 OSS，DB 留摘要**；热表只保 90 天 |
+| `generation_task_links` | ~10 万 | < 100 B | ~0.2 GB | 随任务归档 |
+| `files` + `file_usages` | ~30 万 | < 200 B | ~1.5 GB | GC 清孤儿引用 |
+| OSS 对象 | 50~200 GB | — | 1.5~6 TB | 生命周期：90 天转低频（IA）、180 天转归档；失败任务产物 7 天清理 |
+
+**结论**：关系库年增量 < 50 GB，**RDS 高可用版 4c16g + 500 GB 存储（自动扩容）3 年内无需分库分表**；真正的容量压力在 OSS（媒体文件）与 `generation_tasks` JSON 膨胀，治理重点是 5.5 的 payload 引用化 + 本节归档策略。
+
+**分页与写入放大控制：**
+
+| 机制 | 规则 |
+| --- | --- |
+| 分页上限 | 所有列表接口 `page_size ≤ 100`（Pydantic 校验）；任务中心/文件管理默认 20 |
+| keyset 分页 | `generation_tasks`、`files` 等大表列表用 `(created_at, id)` 游标，禁止 `OFFSET > 10000` |
+| 轮询写放大 | 任务进度更新节流：worker 侧 progress 变更 ≥ 5% 或间隔 ≥ 3 s 才落库，避免轮询风暴放大为 DB 写风暴 |
+| 批量写 | 候选确认、批量工具栏操作走事务批量 UPDATE，禁止循环单条提交 |
+| 大结果集 | Agent 抽取结果分批插入（batch 500），防单事务过大拖慢主从复制 |
+
+### 5.8 Redis 用途与 Key 规划
+
+现状：Redis 仅作 Celery broker（`task_ignore_result=True`，无 result backend）。目标态 Key 清单：
+
+| Key 模式 | 类型 | TTL | 用途 | 状态 |
+| --- | --- | --- | --- | --- |
+| `celery` / `queue:v1` / `queue:v2` / `queue:video` / `queue:image` / `queue:text` | LIST | — | broker 队列（灰度双队列见 4.3；优先级拆队见 10.4 T2） | 现状 + 目标 |
+| `unacked*` | ZSET/HASH | — | Celery 未确认任务（acks_late） | 现状 |
+| `ratelimit:{user_id|ip}:{route}:{window}` | 计数 | 60 s | L3 应用限流滑动窗口（4.4） | 目标 |
+| `quota:user:{uid}:inflight` | 计数 | 任务生命周期 | L4 用户进行中任务配额 | 目标 |
+| `task:status:{task_id}` | HASH | 2 s | `task_status` 轮询缓存（读路径卸载，见 5.9） | 目标 |
+| `lock:reaper:{job}` | 锁 | 60 s + 心跳 | reaper/归档/GC 定时任务多实例互斥（租约锁） | 目标 |
+| `idem:task:{client_request_id}` | 标记 | 24 h | 任务提交幂等键（防前端重复提交/重试重复扣配额） | 目标 |
+| `provider:health:{provider_key}` | HASH | 60 s | 供应商熔断状态位（失败率窗口统计，配合双 provider 切换） | 目标 |
+
+**关键约束**：Tair 必须 `maxmemory-policy=noeviction`（broker 与幂等键不可淘汰）；限流类 Key 允许 Redis 故障时**降级放行**（fail-open，可用性优先，见 8.4），队列类 Key 故障则任务提交快速失败并返回 503 + Retry-After。
+
+### 5.9 读写分离与连接池预算
+
+| 项 | 设计 |
+| --- | --- |
+| 读写分离 | 写路径（创建任务/确认候选/状态流转）→ RDS 主库；读路径（任务轮询/列表/工作台聚合查询）→ 只读实例；`DATABASE_URL` 之外增加 `DATABASE_READ_URL`，`get_db` 依赖按方法注入 |
+| 轮询卸载 | `task_status` 先读 `task:status:{id}` 缓存（2 s TTL），未命中回源只读库——2000 客户端轮询场景下 DB QPS 从 ~700 降到 < 100 |
+| 连接池参数 | SQLAlchemy：`pool_size=20, max_overflow=10, pool_recycle=3600, pool_pre_ping=True`（防 RDS 主备切换后持有死连接）；Celery 同步 engine（`db_sync.py`）独立池 `pool_size=10` |
+| 连接数预算 | 不变量：`API 副本 × 30 + worker 副本 × 20 + 只读实例同额度 ≤ RDS max_connections × 0.8`。示例：API 4 副本 + worker 6 副本 = 240 连接，RDS 4c16g（默认 max_connections ≈ 8,000）余量充足；**扩容至 API+worker 合计 > 100 副本时必须引入 RDS 数据库代理**收敛连接 |
+| 事务边界 | 单请求单事务；Agent 批量落库按章分事务，禁止跨章长事务（防主从延迟与锁等待） |
 
 ---
 
@@ -1126,32 +1251,185 @@ server {
 | 备份 | RDS 自动备份（每日全量 + binlog，保留 30 天，PITR）；OSS 版本化 + 跨区域复制（可选复制 Bangkok）；etcd/ACK 集群自动备份 |
 | 演练 | 每季度：AZ 故障切换演练、RDS 主备切换演练、回滚演练（4.5 时序）、限流压测（k6） |
 
-### 7.4 SLA 99.95% 保障设计
+### 7.4 SLA 与容量总览
 
-**错误预算：月度不可用 ≤ 21.9 分钟。** 分解与保障手段：
-
-| 故障域 | 保障手段 | 预期 MTTR |
-| --- | --- | --- |
-| 单容器/单进程崩溃 | restart: always + K8s 自愈 + ALB 健康检查摘除（30s 内） | < 1 min |
-| 单节点故障 | backend/celery ≥ 2 副本跨 AZ；ACK 自动重调度 | < 3 min |
-| 单 AZ 故障 | ALB/RDS/Tair/ACK 全跨 AZ；RDS 主备自动切换（秒级~30s） | < 5 min |
-| DB 故障 | RDS 高可用版自动 HA；极端情况 PITR | < 30 min（PITR 场景计入预算需评估） |
-| 发布引入故障 | 灰度 5% 起步 + 自动指标回滚（4.3/4.5） | < 5 min |
-| 供应商（AI）故障 | **降级不计入核心 SLA 的话需明示**；建议多 provider 冗余（OpenAI 兼容 + 火山引擎双活），provider `status` 字段支持一键切换，任务失败自动换 provider 重试 1 次 | < 10 min |
-| 流量突增 | WAF/CDN 吸收 + 四层限流（4.4）+ HPA 扩容 | 自动 |
-| 区域级灾难 | 文档化 DR 预案：Bangkok `ap-southeast-7` 冷备（RDS 跨区备份 + OSS 跨区复制 + ACK GitOps 一键重建），RTO ≤ 4h，RPO ≤ 15min（跨区域冷备不承诺 99.95%，属灾难兜底） | ≤ 4 h |
-
-**SLA 计量口径建议**：以 ALB 入口 5xx 比例 + `/health` 可用性合成「服务可用率」；AI 生成成功率单列为业务 SLO（目标 ≥ 95%），与平台 SLA 区分，避免供应商侧故障击穿平台承诺。
-
-**可用性测算（串联模型）**：ALB(99.99%) × ACK 应用层双副本(≈99.99%) × RDS 高可用(99.95%) × Tair 主从(99.9%) ≈ **99.83%~99.95%**。要稳定站上 99.95%，必须做到：① 读路径（任务轮询/查询）走只读实例 + Redis 缓存，与写路径隔离；② 生成链路（Celery→供应商）异步化，供应商慢不拖垮 API（当前架构已满足）；③ 消除单点（现状 compose 单机即单点，生产必须多副本跨 AZ）。
+SLA 99.95% 的度量口径、可用性推导、错误预算管理、故障域韧性设计与灾备演练详见**第 8 章**；业务容量模型、各层容量核算、扩缩容触发条件与压测验收标准详见**第 9 章**。部署形态（7.1~7.3）是二者的载体：多副本跨 AZ、RDS 高可用、Tair 主从是达成 99.95% 的最低配置前提。
 
 ---
 
-## 8. 系统不足与改进措施
+## 8. SLA 99.95% 达成方案
+
+### 8.1 SLA 定义与度量口径
+
+**必须先定义清楚，否则 99.95% 无法验收：**
+
+| 项 | 定义 |
+| --- | --- |
+| 服务窗口 | 7×24，按自然月统计（30 天 = 43,200 分钟） |
+| 不可用判定 | 在 PH/TH 探测点，对 `/health` 或核心 API（`GET /api/v1/film/task_status` 等只读端点）**连续 2 个 15 s 周期**返回 5xx / 连接失败 / 超 10 s 无响应 |
+| 计划内维护 | 提前 72 h 公告、每月 ≤ 30 min，安排在当地低峰（02:00–05:00 PHT/ICT）；必须通过灰度实现**零停机**（零停机维护不计入不可用） |
+| 部分降级 | 成功率 < 99.5% 或 P95 超阈值持续 5 min：计入 **SLO 违约**（错误预算单列跟踪），不计入"完全不可用" |
+| 排除项 | ① AI 供应商自身故障（平台提供重试/换供应商机制，生成失败计入业务 SLO 而非平台 SLA）；② 阿里云公告的区域级 IaaS 故障；③ 客户侧网络/浏览器问题；④ 超出限流配额的 429；⑤ 生成任务本身的业务性失败（提示词违规等） |
+| **月度不可用预算** | 43,200 × 0.05% = **21.6 分钟**（周预算 5.04 分钟，日预算 0.72 分钟） |
+
+**计量合成**：`平台可用率 = f(ALB 入口 5xx 比例, /health 拨测可用率)`，由 ARMS + 云拨测（PH/TH 双探测点）出月报；**生成成功率（目标 ≥ 95%）单列为业务 SLO**，与平台 SLA 分离——避免供应商侧故障击穿平台赔付承诺。
+
+### 8.2 可用性推导（为什么必须按第 7 章拓扑部署）
+
+| 环节 | 配置 | 期望可用性 | 备注 |
+| --- | --- | --- | --- |
+| DNS + GA/DCDN | 健康探测 + 多区域边缘 | 99.99% | TH 流量经 GA 专线回源，公网劣化不放大 |
+| WAF + ALB | 阿里云多 AZ 实例 | 99.99% | 长任务提交接口超时需要 ≥ 300 s 配置，避免"假不可用" |
+| ACK 控制面 | Pro 托管版多 AZ | 99.95% | 控制面故障不影响已运行 Pod 数据面 |
+| API 数据面 | ≥ 3 副本跨 2 AZ、readiness 探针、PDB、preStop 排空 | 99.99% | 单实例 99.5% × 3 副本并联 ≈ 99.9999% |
+| Celery 执行面 | ≥ 3 worker 跨 2 AZ + KEDA 队列深度扩缩 | 99.9% | **worker 全挂不阻塞 API 可用性**（任务只入队不执行，计入业务 SLO 降级而非平台不可用） |
+| 主库 | RDS 高可用版跨 AZ 主备自动切换 | 99.99% | 切换 ≤ 30 s，写失败由客户端重试吸收；`pool_pre_ping` 加速连接收敛 |
+| 缓存/broker | Tair 主从跨 AZ | 99.95% | Redis 故障时**限流 fail-open、任务提交快速失败 503**（见 5.8），不放大为 API 全站 5xx |
+| 对象存储 | OSS（区域内多 AZ 冗余） | 99.995% | 产物转存失败任务标记可重试，不丢真相（DB 先行） |
+| AI 供应商 | OpenAI 兼容 + 火山引擎双活 | — | 不计入平台 SLA；`provider:health` 熔断 + 自动换供应商重试 1 次 |
+
+**串联（近似独立）**：`0.9999(DNS/ALB) × 0.9999(API) × 0.9999(RDS) × 0.9995(Tair) × 0.99995(OSS) ≈ 0.9992`——注意：**Tair 与读路径是短板**。要稳定站上 99.95% 必须做到：
+
+1. 读路径（任务轮询/列表）走只读实例 + Redis 2 s 缓存，**Redis 故障时缓存穿透到只读库而非报错**（降级放行）；
+2. 生成链路（Celery → 供应商）与 API 链路完全异步解耦（当前架构已满足），供应商慢/挂不拖垮 API；
+3. 消除单点：现状 compose 单机形态 ≈ 99.5%（不达标），生产必须 7.1/7.3 的多副本跨 AZ 形态；
+4. 留 ~0.03% 预算给"人因与变更"（业界最大故障源），靠灰度 + 自动回滚（4.3/4.5）压缩。
+
+### 8.3 错误预算管理
+
+```mermaid
+flowchart TD
+    A["每月错误预算 21.6 分钟"] --> B["实时消耗统计<br/>5min 窗口累计不可用 + SLO 违约"]
+    B --> C{"燃尽比例"}
+    C -->|"< 50%"| D["正常发布节奏"]
+    C -->|"50% ~ 80%"| E["发布双人审批<br/>灰度观察窗口 30min → 60min"]
+    C -->|"> 80%"| F["冻结非必要发布<br/>只允许修复与止血变更"]
+    C -->|"燃尽"| G["停止所有变更进入稳定期<br/>触发正式事件复盘（含供应商侧根因）"]
+    D --> H["月度复盘：按故障源分类<br/>（变更/依赖/容量/供应商）→ 反哺门禁与预案"]
+    E --> H
+    F --> H
+    G --> H
+```
+
+### 8.4 故障域与韧性设计
+
+| 故障域 | 检测 | 自动处置 | 人工处置 | RTO |
+| --- | --- | --- | --- | --- |
+| 单容器/Pod 崩溃（OOM/panic） | readiness 失败 + restart 计数告警 | K8s 重启、ALB 30 s 内摘除 | 看 core dump / 内存剖析 | 秒级 |
+| 单节点故障 | node NotReady | Pod 反亲和 + ACK 自动重调度到另一 AZ | 扩容节点池 | ≤ 3 min |
+| 单 AZ 故障 | CloudMonitor + 拨测 | ALB/RDS/Tair 跨 AZ 自动切换；HPA 在存活 AZ 扩容 | 确认容量水位 | ≤ 5 min |
+| RDS 主库故障 | 连接错误 + RDS HA 事件 | 主备自动切换（≤ 30 s）；应用 `pool_pre_ping` 重建连接 | 切换后校验任务状态一致性（reaper 对账） | ≤ 1 min |
+| Tair/Redis 故障 | `redis_up == 0` | 限流降级 fail-open；轮询缓存穿透只读库；**新任务提交 503 + Retry-After**（broker 不可用） | 立即恢复 Tair；期间积压任务恢复后重放 | 分钟级 |
+| Celery worker 全部失活 | 队列深度 > 500 且消费速率 = 0 | KEDA 扩容；reaper 把 executor 失活的 `running` 任务标记 failed(可重试) | 检查镜像/broker 凭据 | ≤ 10 min |
+| AI 供应商故障/配额耗尽 | `provider:health` 失败率窗口 + 任务失败率告警 | 熔断该 provider → 自动路由到备用 provider 重试 1 次 | 调整 `model_settings` 默认模型（≤ 60 s 生效） | ≤ 10 min |
+| OSS 故障/限流 | 转存失败率告警 | 任务重试（指数退避）；产物 URL 暂存 result 待补转 | 提工单；必要时临时切备用 bucket | 分钟级 |
+| 发布引入故障 | 灰度指标对比（4.3） | ALB 权重自动归零回滚（4.5） | 复盘 + 前向修复 | ≤ 5 min |
+| 配置误改（默认模型/供应商） | 变更后 5 min 成功率劣化 | 无自动识别（缺配置基线）→ 依赖审计日志 | Nacos 历史版本一键回退 | ≤ 2 min |
+| 流量突增/CC 攻击 | WAF/ALB QPS 异常 | CDN/WAF 吸收 + 四层限流（4.4）+ HPA 扩容 | 封禁恶意 IP 段 | 自动 |
+| NAT 出口故障（worker → 供应商） | 出口探测失败 | 多 EIP 冗余切换 | 检查 NAT 网关配额 | ≤ 5 min |
+| 磁盘/存储打满 | 使用率 > 85% 告警 | RDS 存储自动扩容；OSS 无上限；日志按 4.1 生命周期投递 | 清理临时产物 | 分钟级 |
+| 区域级灾难（Manila 全区） | GTM/拨测连续失败 | DNS 切 Bangkok 冷备（文档化预案，非自动） | 按 DR runbook 重建（GitOps + RDS 跨区备份 + OSS 跨区复制） | ≤ 4 h（RPO ≤ 15 min） |
+
+### 8.5 分级 SLO 分解（内部承诺）
+
+| 服务 | SLO | 违约动作 |
+| --- | --- | --- |
+| API 网关（读路径） | 可用率 99.95%，P99 ≤ 500 ms | 燃尽预警 → 冻结发布 |
+| API 网关（写路径/任务提交） | 可用率 99.9%，P99 ≤ 1.5 s | 同上 |
+| 任务执行（图片） | P95 端到端 ≤ 3 min，成功率 ≥ 97% | 供应商侧根因分析 |
+| 任务执行（视频） | P95 端到端 ≤ 15 min，成功率 ≥ 95% | 同上 + 容量评估（第 9 章） |
+| Agent 剧本处理 | P95 ≤ 90 s，成功率 ≥ 97% | 检查 LLM 配额与超时配置 |
+| 数据层 | 主从延迟 P99 ≤ 5 s；慢查询 < 0.1% | 索引评审（5.4） |
+
+### 8.6 灾备演练（季度必做）
+
+1. **AZ 切换演练**：强制驱逐单 AZ 全部 Pod，验证另一 AZ 承载全量（容量预留 1.5 倍，见 9.5）且 TH 用户 RTT 上升 < 90 ms；
+2. **RDS 主备切换 + PITR 演练**：触发 HA 切换验证应用重连 ≤ 60 s；从 binlog 恢复到新实例，跑任务状态对账（验证 RPO ≤ 5 min）；
+3. **Redis 摘除演练**：断开 Tair，验证限流 fail-open、轮询穿透只读库、任务提交优雅 503，**无 5xx 雪崩**；
+4. **回滚演练**：从灰度门禁失败到 ALB 权重归零，实测止血耗时（目标 < 60 s）；
+5. **供应商全故障演练**：mock 双 provider 100% 失败，验证熔断、任务不重复扣配额、失败原因可追溯、reaper 收敛悬挂任务；
+6. **worker 悬挂对账演练**：kill -9 全部 worker，验证 reaper 在 2 个扫描周期内把 `running` 失活任务标记 failed(可重试) 且用户可重新提交。
+
+---
+
+## 9. 容量设计与压测验收
+
+### 9.1 业务容量模型（所有资源核算的输入）
+
+| 参数 | 基线值 | 峰值系数 | 峰值推导 |
+| --- | --- | --- | --- |
+| 活跃创作团队（DAU） | 500 | — | PH 350 + TH 150 |
+| 并发在线编辑用户 | 100 | ×3（当地 19:00–23:00 高峰） | 300 |
+| 新增项目/日 | 20 | ×2 | 40 |
+| 新增镜头/日 | 1.6 万 | ×2 | 3.2 万 |
+| 生成任务/日（图 + 视频 + 文本） | 7 万 | ×2 | 14 万 ≈ 峰值 6 任务/s 入队 |
+| 其中视频长任务（1~10 min/个） | 2 万 | ×2 | **峰值并发视频任务 ≈ 200~400**（关键容量约束） |
+| API 请求（含轮询） | 日均 500 万 | — | 峰值 400 QPS（轮询占 ~70%） |
+| OSS 日增量 | 50~200 GB | — | 峰值日 300 GB；视频产物占 > 80% |
+
+> 以上为规划基线，上线后每月用真实指标（ARMS + task-log）回填校正，容量结论随之滚动更新。
+
+### 9.2 应用层容量核算
+
+| 组件 | 单实例基线（待压测实测替换） | 峰值需求 | 副本结论 |
+| --- | --- | --- | --- |
+| backend API（4c8g） | 400 QPS（读为主，P99 < 500 ms）；asyncio 并发连接 ~1000 | 400 QPS | **2 副本即可扛峰值，按 N+1 部署 3 副本跨 2 AZ** |
+| Celery worker（视频队列，4c8g，`-c 4`） | 4 并发长任务/worker（IO 密集，async 桥接，1800 s 超时） | 并发视频任务 400 | **视频队列 ≈ 100 并发 worker 槽位 → 8~10 副本**；或改 gevent/提升 `-c` 至 16（IO 密集型可行）压到 3 副本，需压测验证内存 |
+| Celery worker（图片/文本队列） | 16 并发/worker | 图片峰值 ~4 任务/s、文本 Agent 并发 ≤ 50 | 2~3 副本独立队列（防视频长任务阻塞轻任务，见 10.4 T2） |
+| front nginx | 静态资源走 CDN，源站 < 50 QPS | — | 2 副本 |
+| KEDA 扩缩 | 队列深度 > 100/worker 触发扩容；< 10 触发缩容 | — | 视频队列弹性上限 16 副本 |
+
+### 9.3 数据层容量核算
+
+| 资源 | 规格结论 | 核算依据 |
+| --- | --- | --- |
+| RDS MySQL | 高可用版 **4c16g + 500 GB ESSD PL1**（存储自动扩容开）+ 只读 2c8g | 写 TPS 峰值 < 50（任务状态节流后），读经只读实例 + 缓存 < 200 QPS；年增 < 50 GB（5.7）；buffer pool 16g × 60% 可全缓存 3 年热数据 |
+| 连接数 | 主库预算 ≤ 400（5.9 不变量），只读实例 ≤ 200 | 远低于 RDS 默认 max_connections，无需代理；> 100 副本时引入 RDS 代理 |
+| Tair Redis | 主从版 **4 GB**（noeviction） | 队列峰值 5000 任务 × ~2 KB ≈ 10 MB + 限流/缓存/锁 < 500 MB + Celery unacked，余量 8 倍 |
+| OSS | 标准存储，**年增 20~70 TB** | 生命周期 90 天转 IA / 180 天转归档后，热存储稳态 ≈ 6~12 TB；归档层承接历史项目 |
+| CDN/DCDN | 月流量 ≈ 15~40 TB | 视频产物下发为主（9.4） |
+| SLS | 月写入 ≈ 50~100 GB | app/access/task/integration 四 logstore，30 天热存 + 180 天冷存 |
+
+### 9.4 带宽与出口容量
+
+| 链路 | 估算 | 预留 |
+| --- | --- | --- |
+| 产物回传（供应商 → worker → OSS） | 2 万视频/日 × 20 MB ≈ 400 GB/日 下行 + 等量上行 | NAT 出口带宽 ≥ 200 Mbps（峰值 3 倍系数 ≈ 110 Mbps） |
+| CDN 用户下发 | 400 GB/日 × 命中回源比 + 直接下发 ≈ 峰值 250~400 Mbps | DCDN 按带宽峰值计费，95 计费评估 |
+| worker → 供应商轮询 | 400 并发任务 × 每 5 s 一次 ≈ 80 QPS 小请求 | 固定 EIP ≥ 2 个（供应商白名单 + 出口冗余） |
+| 帧图 base64 提交 | 图片任务峰值 4/s × 3 帧 × 2 MB ≈ 24 MB/s | **提交前压缩/引用化**（5.5），API 侧 body 上限 50 MB |
+
+### 9.5 扩缩容触发条件与弹性策略
+
+| 指标 | 扩容阈值 | 缩容阈值 | 动作 |
+| --- | --- | --- | --- |
+| API CPU（HPA） | > 60% 持续 3 min | < 30% 持续 15 min | ±1 副本，上限 8 |
+| 视频队列深度（KEDA） | > 100/worker 槽位 | < 10 | worker ±2，上限 16 |
+| API P99 | > 1 s 持续 5 min | — | 先查慢 SQL/供应商，再扩容 |
+| RDS CPU / IOPS | > 70% 持续 10 min | — | 升配（在线变配 < 30 min，安排低峰） |
+| Redis 内存 | > 75% | — | 升配 |
+| OSS 带宽限流事件 | 出现即告警 | — | 提配额工单 / 拆分 bucket 前缀 |
+| **区域容量预留不变量** | 单 AZ 必须能承载全量峰值的 **1.5 倍** | — | 每次容量评审校验（AZ 故障时另一 AZ 可扛全量） |
+
+### 9.6 压测验收标准（k6，`loadtest/` 目录落地）
+
+| 场景 | 负载模型 | 通过标准 |
+| --- | --- | --- |
+| S1 API 基线 | 400 QPS 混合（70% 读：task_status/列表；30% 写：候选确认/任务提交），阶梯加压至 800 QPS | 400 QPS 下 P99 < 500 ms（读）/ 1.5 s（写），错误率 < 0.1%；找出拐点 QPS |
+| S2 任务风暴 | 并发提交 500 视频任务（mock 供应商，异步轮询模式） | 入队 202 全成功、无重复执行（幂等键校验）、队列消费无饿死（图片/文本队列 P95 不受影响） |
+| S3 轮询压力 | 2000 虚拟用户 × 每 3 s 轮询 task_status | 缓存命中 > 90%，DB QPS < 100，P99 < 200 ms |
+| S4 供应商劣化 | mock 供应商延迟 30 s / 50% 失败 | 熔断触发、自动换 provider、任务成功率 ≥ 90%、API 层无级联超时 |
+| S5 浸泡测试 | S1 的 60% 负载 × 8 h | 无内存泄漏（RSS 增长 < 10%）、无连接泄漏、无从延迟累积 |
+
+**验收规则**：每次大版本发布前跑 S1~S4；每夜间 CI 跑 S1 留存基线趋势；压测报告（含实测单实例基线）回填 9.2 表格替换估算值——**未经压测的数字不得写入对外 SLA 承诺**。
+
+---
+
+## 10. 系统不足与改进措施
 
 > 按优先级排序（P0 = 生产化阻断项）。
 
-### 8.1 安全（P0）
+### 10.1 安全（P0）
 
 | # | 不足 | 现状证据 | 改进措施 |
 | --- | --- | --- | --- |
@@ -1161,7 +1439,7 @@ server {
 | S4 | 供应商密钥走明文环境变量 | compose `.env` | 迁移阿里云 KMS/Secrets Manager，ACK Secret 加密存储，定期轮转 |
 | S5 | 对象存储 URL 若直接暴露存在越权访问风险 | `S3_PUBLIC_BASE_URL` 直链 | 媒体访问改签名 URL（短时效）+ CDN 鉴权（URL Auth） |
 
-### 8.2 可观测性（P0）
+### 10.2 可观测性（P0）
 
 | # | 不足 | 改进措施 |
 | --- | --- | --- |
@@ -1169,7 +1447,7 @@ server {
 | O2 | 无 metrics/tracing | `prometheus-fastapi-instrumentator` + `celery-exporter`；OTel SDK 贯通 API→Celery→供应商调用 |
 | O3 | `/health` 无依赖深度检查 | 增加 `/health/ready`（探测 DB/Redis/S3）供 ALB/K8s 就绪探针，`/health/live` 保持轻量 |
 
-### 8.3 数据层（P1）
+### 10.3 数据层（P1）
 
 | # | 不足 | 改进措施 |
 | --- | --- | --- |
@@ -1178,8 +1456,10 @@ server {
 | D3 | `running` 状态任务在 worker 崩溃后可能悬挂 | 增加 reaper：定期扫描 `running` 且 executor 心跳超时的任务 → 标记 failed(可重试) 或自动重入队（幂等键 = task_id） |
 | D4 | 无孤儿文件治理 | `file_usages` 已具备引用关系，补充定期 GC 任务清理无引用 files 与 OSS 对象 |
 | D5 | SQLite 默认配置易被误用于生产 | config 启动时校验：非 debug 模式禁止 sqlite，强制 MySQL |
+| D6 | **任务 payload 快照可能包含帧图 base64**（`VideoGenerationInput` 三参考帧），单行数 MB，导致 `generation_tasks` 膨胀与主从复制延迟 | payload 中 base64 一律替换为 `file_id/object_key` 引用，提交供应商时再物化（见 5.5）；完成态任务 30 天后 payload 转存 OSS（见 5.7） |
+| D7 | 索引未按查询模式设计、列表接口无分页上限、无 keyset 分页 | 落地 5.4 索引清单（P0 项先行）；Pydantic 强制 `page_size ≤ 100`；大表列表改 `(created_at, id)` 游标分页 |
 
-### 8.4 任务与生成链路（P1）
+### 10.4 任务与生成链路（P1）
 
 | # | 不足 | 改进措施 |
 | --- | --- | --- |
@@ -1189,7 +1469,7 @@ server {
 | T4 | `/script_processing` 20+ 端点为同步 Agent 调用，LLM 慢时占满 API worker | 按既有 `plans/task-async-cancellation-plan.md` 推进任务化：同步端点改为「创建任务 + 轮询/SSE」，API 层不再长阻塞 |
 | T5 | 供应商单点依赖 | 双 provider 冗余 + 故障自动切换；能力表已支持 (provider, model) 维度，补充「同能力多 provider 路由策略」 |
 
-### 8.5 工程质量与交付（P2）
+### 10.5 工程质量与交付（P2）
 
 | # | 不足 | 改进措施 |
 | --- | --- | --- |
@@ -1200,9 +1480,9 @@ server {
 | E5 | 部署仍依赖 ghcr.io（PH/TH 拉取慢且受网络影响） | 镜像同步 ACR Manila（7.3）；部署走 GitOps（ArgoCD），杜绝手工 compose up 生产 |
 | E6 | compose 单机形态无高可用 | 按 7.1/7.3 迁移 ACK 多副本跨 AZ；compose 仅保留 staging/本地用途 |
 | E7 | 无用户/多租户模型，项目数据无隔离 | 随 S1 认证一并引入 user/tenant 维度与行级隔离，为多团队协作与计费打基础 |
-| E8 | 文档站 plans 中多项计划未落地（生成链收敛重构等） | 按 AGENTS.md 约定保持 plans 与代码同步；本文件 8.4/8.1 与其对齐排期 |
+| E8 | 文档站 plans 中多项计划未落地（生成链收敛重构等） | 按 AGENTS.md 约定保持 plans 与代码同步；本文件 10.4/10.1 与其对齐排期 |
 
-### 8.6 改进路线图建议
+### 10.6 改进路线图建议
 
 ```mermaid
 gantt
@@ -1215,21 +1495,23 @@ gantt
     密钥治理 KMS (S4)           :a4, after a3, 5d
     section P1 稳定性
     Alembic 迁移收编 (D1)       :b1, after a2, 7d
+    索引+分页治理 (D7)          :b5, after a2, 5d
+    payload base64 引用化 (D6)  :b6, after b1, 5d
     任务重试+队列拆分+reaper (T1-T3,D3) :b2, after b1, 10d
     script_processing 异步化 (T4) :b3, after b2, 14d
     只读实例+缓存 (D2)          :b4, after b1, 5d
     section P2 交付质量
     ACK+ACR+GitOps 迁移 (E5/E6) :c1, after a4, 14d
-    k6 压测体系 (E1)            :c2, after c1, 7d
+    k6 压测体系+第9章验收 (E1)   :c2, after c1, 7d
     E2E+契约测试 (E2/E4)        :c3, after c2, 14d
     多租户 (E7)                 :c4, after c3, 21d
 ```
 
 ---
 
-## 9. 附录
+## 11. 附录
 
-### 9.1 关键验证命令
+### 11.1 关键验证命令
 
 ```bash
 # 后端
@@ -1247,7 +1529,7 @@ curl http://localhost:8000/health                            # 健康检查
 curl http://localhost:8000/docs                              # OpenAPI 文档
 ```
 
-### 9.2 术语表
+### 11.2 术语表
 
 | 术语 | 含义 |
 | --- | --- |
@@ -1259,11 +1541,12 @@ curl http://localhost:8000/docs                              # OpenAPI 文档
 | 候选（candidate） | AI 抽取的待确认资产/对白，经 accept 后才进入正式资产表 |
 | provider_key | 供应商标识（openai / volcengine），与 model 组成适配器注册双键 |
 
-### 9.3 SLA 承诺口径（对外建议文本）
+### 11.3 SLA 承诺口径（对外建议文本）
 
 - **平台可用性 99.95%/月**：以入口网关 5xx 比例与 `/health` 探测合成计量；不含计划内维护（提前 72h 公告、安排在当地低峰 02:00–05:00 PHT/ICT）。
 - **生成成功率 SLO ≥ 95%**（业务指标，非 SLA 赔付口径）：受第三方 AI 供应商影响的失败，系统提供自动换供应商重试与手动重试入口。
-- **RPO/RTO**：数据 RPO ≤ 5min（binlog），平台级 RTO ≤ 30min，区域灾难 RTO ≤ 4h（冷备）。
+- **RPO/RTO**：数据 RPO ≤ 5min（binlog）；发布回滚 RTO ≤ 5min，重大故障 RTO ≤ 30min，区域灾难 RTO ≤ 4h（冷备），与 8.4/8.6 口径一致。
+- **计量与排除项**：不可用判定、部分降级、排除项（供应商故障/区域级 IaaS/客户侧网络/429 限流）按 8.1 定义执行，月度出可用率报告。
 
 ---
 
